@@ -13,6 +13,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
 from typing import Any, TypeAlias
+from urllib.parse import unquote
 
 from loguru import logger
 
@@ -41,6 +42,16 @@ except ModuleNotFoundError as e:
 ServerParameters: TypeAlias = StdioServerParameters | SseServerParameters | StreamableHttpParameters
 
 _MAX_ERROR_DETAIL = 200
+
+# Schema keywords whose values are data, so a "$ref" inside one is no reference.
+_SCHEMA_DATA_KEYWORDS = frozenset({"const", "default", "enum", "examples"})
+# Schema keywords mapping names (a property's, say) to subschemas.
+_SCHEMA_MAP_KEYWORDS = frozenset(
+    {"properties", "patternProperties", "dependentSchemas", "dependencies"}
+)
+_SCHEMA_DEFINITIONS_KEYWORDS = frozenset({"$defs", "definitions"})
+# What a recursive reference keeps of its definition.
+_SCHEMA_REPEAT_KEYWORDS = ("type", "title", "description")
 
 
 class _NotConnectedError(RuntimeError):
@@ -145,6 +156,79 @@ def _connect_failure_cause(*candidates: BaseException | None) -> Exception | Non
         if isinstance(cause, Exception):
             return cause
     return None
+
+
+def _local_ref_target(root: dict[str, Any], ref: str) -> dict[str, Any] | None:
+    """Find the subschema a reference names inside the schema it belongs to.
+
+    Args:
+        root: The whole schema.
+        ref: The reference, a JSON pointer in a URI fragment such as ``#/$defs/Address``.
+
+    Returns:
+        The subschema, or ``None`` for a reference that points outside ``root``
+        or names nothing in it.
+    """
+    if ref == "#":
+        return root
+    if not ref.startswith("#/"):
+        return None
+    target: Any = root
+    for token in ref[2:].split("/"):
+        token = unquote(token).replace("~1", "/").replace("~0", "~")
+        if isinstance(target, dict) and token in target:
+            target = target[token]
+        elif isinstance(target, list) and token.isdigit() and int(token) < len(target):
+            target = target[int(token)]
+        else:
+            return None
+    return target if isinstance(target, dict) else None
+
+
+def _inline_refs(schema: Any, root: dict[str, Any], expanding: tuple[str, ...] = ()) -> Any:
+    """Inline the references a tool's input schema makes to its own definitions.
+
+    The adapters build a tool's parameters from its properties alone, so its
+    definitions never reach the provider, and some providers, such as Gemini,
+    accept no ``$ref`` either. Keywords beside a reference win over the
+    definition's own. A reference repeating one it is already inside of, as a
+    recursive model's does, keeps only the definition's type, title and
+    description. A reference that points outside the schema is left as is.
+
+    Args:
+        schema: The subschema to inline.
+        root: The whole input schema, which the references point into.
+        expanding: The references being inlined around ``schema``.
+
+    Returns:
+        A copy of ``schema`` with its local references inlined and its
+        definitions dropped.
+    """
+    if isinstance(schema, list):
+        return [_inline_refs(item, root, expanding) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and (target := _local_ref_target(root, ref)) is not None:
+        if ref in expanding:
+            inlined = {key: target[key] for key in _SCHEMA_REPEAT_KEYWORDS if key in target}
+        else:
+            inlined = _inline_refs(target, root, (*expanding, ref))
+        siblings = {key: value for key, value in schema.items() if key != "$ref"}
+        return {**inlined, **_inline_refs(siblings, root, expanding)}
+
+    result = {}
+    for key, value in schema.items():
+        if key in _SCHEMA_DEFINITIONS_KEYWORDS:
+            continue
+        if key in _SCHEMA_DATA_KEYWORDS:
+            result[key] = value
+        elif key in _SCHEMA_MAP_KEYWORDS and isinstance(value, dict):
+            result[key] = {name: _inline_refs(sub, root, expanding) for name, sub in value.items()}
+        else:
+            result[key] = _inline_refs(value, root, expanding)
+    return result
 
 
 class _ToolWrapperWithCleanup:
@@ -522,8 +606,12 @@ class MCPClient(BaseObject):
         logger.debug(f"Converting schema for tool '{tool_name}'")
         logger.trace(f"Original schema: {json.dumps(tool_schema, indent=2)}")
 
-        properties = tool_schema["input_schema"].get("properties", {})
-        required = tool_schema["input_schema"].get("required", [])
+        input_schema = tool_schema["input_schema"]
+        properties = {
+            name: _inline_refs(prop, input_schema)
+            for name, prop in input_schema.get("properties", {}).items()
+        }
+        required = input_schema.get("required", [])
 
         fixed = self._tools_arguments.get(tool_name)
         if fixed:

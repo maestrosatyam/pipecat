@@ -8,13 +8,16 @@
 
 import asyncio
 import io
+import json
 import unittest
 from contextlib import asynccontextmanager
+from enum import StrEnum
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from loguru import logger
+from pydantic import BaseModel
 
 # MCP is an optional dependency (the `mcp` extra); skip the whole module if it
 # isn't installed.
@@ -37,12 +40,20 @@ from pipecat.services.llm_service import LLMService  # noqa: E402
 from pipecat.services.mcp_service import MCPClient  # noqa: E402
 
 
-def _tool(name, properties=None, required=None, description="A tool."):
-    """Build a fake MCP server tool as returned by ``session.list_tools()``."""
+def _tool(name, properties=None, required=None, description="A tool.", definitions=None):
+    """Build a fake MCP server tool as returned by ``session.list_tools()``.
+
+    ``definitions`` is merged into the input schema as given, so it carries its
+    own key: ``$defs``, or ``definitions`` before JSON Schema 2019-09.
+    """
     return SimpleNamespace(
         name=name,
         description=description,
-        input_schema={"properties": properties or {}, "required": required or []},
+        input_schema={
+            "properties": properties or {},
+            "required": required or [],
+            **(definitions or {}),
+        },
     )
 
 
@@ -336,6 +347,131 @@ class TestToolsArguments(MCPClientTestBase):
         await self._call_via_handler(tools_schema, "other", {"x": "y"})
         self.assertEqual(server.calls, [("other", {"x": "y", "hidden": 1})])
         await client.close()
+
+
+class TestToolSchemaReferences(MCPClientTestBase):
+    """tools(): references to the schema's own definitions are inlined."""
+
+    async def _read_schema(self, properties, definitions, required=None):
+        client, _ = self._make_client(
+            [_tool("tool_a", properties, required, definitions=definitions)]
+        )
+        tools_schema = await client.tools()
+        await client.close()
+        return tools_schema.standard_tools[0]
+
+    async def test_a_reference_reads_as_the_definition_it_names(self):
+        address = {
+            "type": "object",
+            "properties": {"street": {"type": "string"}, "city": {"type": "string"}},
+            "required": ["street", "city"],
+        }
+        schema = await self._read_schema(
+            {"addr": {"$ref": "#/$defs/Address"}},
+            {"$defs": {"Address": address}},
+            required=["addr"],
+        )
+        self.assertEqual(schema.properties, {"addr": address})
+        self.assertEqual(schema.required, ["addr"])
+
+    async def test_keywords_beside_a_reference_are_kept(self):
+        unit = {"type": "string", "enum": ["celsius", "fahrenheit"], "title": "Unit"}
+        schema = await self._read_schema(
+            {"unit": {"$ref": "#/$defs/Unit", "default": "celsius", "description": "Units."}},
+            {"$defs": {"Unit": unit}},
+        )
+        self.assertEqual(
+            schema.properties["unit"], {**unit, "default": "celsius", "description": "Units."}
+        )
+
+    async def test_references_inside_definitions_are_inlined(self):
+        definitions = {
+            "$defs": {
+                "Item": {
+                    "type": "object",
+                    "properties": {"unit": {"$ref": "#/$defs/Unit"}},
+                },
+                "Unit": {"type": "string", "enum": ["kg", "lb"]},
+            }
+        }
+        schema = await self._read_schema(
+            {"items": {"type": "array", "items": {"$ref": "#/$defs/Item"}}}, definitions
+        )
+        self.assertEqual(
+            schema.properties["items"]["items"],
+            {"type": "object", "properties": {"unit": {"type": "string", "enum": ["kg", "lb"]}}},
+        )
+
+    async def test_draft_07_definitions_are_inlined(self):
+        schema = await self._read_schema(
+            {"unit": {"$ref": "#/definitions/Unit"}},
+            {"definitions": {"Unit": {"type": "string", "enum": ["kg", "lb"]}}},
+        )
+        self.assertEqual(schema.properties["unit"], {"type": "string", "enum": ["kg", "lb"]})
+
+    async def test_a_recursive_definition_stops_where_it_repeats(self):
+        node = {
+            "type": "object",
+            "title": "Node",
+            "description": "A tree node.",
+            "properties": {
+                "name": {"type": "string"},
+                "children": {"type": "array", "items": {"$ref": "#/$defs/Node"}},
+            },
+        }
+        schema = await self._read_schema(
+            {"root": {"$ref": "#/$defs/Node"}}, {"$defs": {"Node": node}}
+        )
+        children = schema.properties["root"]["properties"]["children"]
+        # The repeat keeps the definition's type and what describes it, not its fields.
+        self.assertEqual(
+            children["items"], {"type": "object", "title": "Node", "description": "A tree node."}
+        )
+
+    async def test_a_reference_outside_the_schema_is_left_as_is(self):
+        properties = {
+            "remote": {"$ref": "https://example.com/address.json"},
+            "missing": {"$ref": "#/$defs/Missing"},
+        }
+        schema = await self._read_schema(properties, {"$defs": {}})
+        self.assertEqual(schema.properties, properties)
+
+    async def test_values_and_parameter_names_are_not_read_as_schema_keywords(self):
+        properties = {
+            "$ref": {"type": "string"},
+            "definitions": {"type": "string"},
+            "config": {"type": "object", "default": {"$ref": "#/$defs/Unit"}},
+        }
+        schema = await self._read_schema(properties, {"$defs": {"Unit": {"type": "string"}}})
+        self.assertEqual(schema.properties, properties)
+
+    async def test_a_pydantic_model_argument_advertises_a_self_contained_schema(self):
+        class Unit(StrEnum):
+            CELSIUS = "celsius"
+            FAHRENHEIT = "fahrenheit"
+
+        class Address(BaseModel):
+            street: str
+            city: str
+
+        class Arguments(BaseModel):
+            addr: Address
+            unit: Unit = Unit.CELSIUS
+
+        # The input schema an MCP server built on Pydantic advertises.
+        input_schema = Arguments.model_json_schema()
+        tool = SimpleNamespace(name="ship", description="Ship it.", input_schema=input_schema)
+        client, _ = self._make_client([tool])
+        parameters = (await client.tools()).standard_tools[0].to_default_dict()["parameters"]
+        await client.close()
+
+        self.assertNotIn("$ref", json.dumps(parameters))
+        self.assertEqual(parameters["properties"]["addr"], input_schema["$defs"]["Address"])
+        self.assertEqual(parameters["properties"]["unit"]["enum"], ["celsius", "fahrenheit"])
+        self.assertEqual(parameters["properties"]["unit"]["default"], "celsius")
+        self.assertEqual(parameters["required"], ["addr"])
+        # The server's own schema is left as it was.
+        self.assertEqual(input_schema, Arguments.model_json_schema())
 
 
 class TestCallErrors(MCPClientTestBase):
