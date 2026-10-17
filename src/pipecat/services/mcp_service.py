@@ -585,16 +585,19 @@ class MCPClient(BaseObject):
         response = ""
         if results:
             if results.content:
+                texts = []
                 for i, content in enumerate(results.content):
                     # The session is typed, so the result is too: only TextContent
                     # carries a text field, on either SDK line.
                     if isinstance(content, TextContent) and content.text:
                         logger.debug(f"Tool response chunk {i}: {content.text}")
-                        response += content.text
+                        texts.append(content.text)
                     else:
                         logger.debug(
                             f"Tool response chunk {i} carries no text: {type(content).__name__}"
                         )
+                # A server SDK sends each item of a returned list as a block of its own.
+                response = "\n".join(texts)
             else:
                 logger.error(f"Error getting content from {function_name} results.")
 

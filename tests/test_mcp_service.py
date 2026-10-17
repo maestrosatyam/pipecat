@@ -66,6 +66,7 @@ class _FakeServer:
         self.call_errors = []
         self.empty_results = False
         self.non_text_results = False
+        self.call_result = None
         self.on_connect = None
         self.on_call_once = None
         self.on_exit_once = None
@@ -118,6 +119,8 @@ class _FakeSession:
             await hook()
         if server.call_errors:
             raise server.call_errors.pop(0)
+        if server.call_result is not None:
+            return server.call_result
         if server.empty_results:
             return CallToolResult(content=[])
         if server.non_text_results:
@@ -266,6 +269,19 @@ class TestTools(MCPClientTestBase):
         await schema.handler(params)
         self.assertEqual(server.calls, [("tool_a", {"x": "hello"})])
         params.result_callback.assert_awaited_once_with("tool_a-RESULT")
+        await client.close()
+
+    async def test_handler_delivers_each_text_block_on_its_own_line(self):
+        client, server = self._make_client([_tool("tool_a")])
+        server.call_result = CallToolResult(
+            content=[
+                TextContent(type="text", text="Paris"),
+                TextContent(type="text", text="London"),
+            ]
+        )
+        tools_schema = await client.tools()
+        result_callback = await self._call_via_handler(tools_schema, "tool_a")
+        result_callback.assert_awaited_once_with("Paris\nLondon")
         await client.close()
 
     async def test_handler_applies_output_filter(self):
