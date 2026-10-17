@@ -583,6 +583,8 @@ class MCPClient(BaseObject):
                     logger.error(f"{self} error dropping the dead session: {drop_error}")
 
         response = ""
+        # A call that succeeded with nothing to return, as a tool ending the call does.
+        no_output = False
         if results:
             if results.content:
                 texts = []
@@ -598,8 +600,13 @@ class MCPClient(BaseObject):
                         )
                 # A server SDK sends each item of a returned list as a block of its own.
                 response = "\n".join(texts)
-            else:
+            elif results.is_error:
                 logger.error(f"Error getting content from {function_name} results.")
+            elif results.structured_content and results.structured_content != {"result": None}:
+                response = json.dumps(results.structured_content, ensure_ascii=False)
+            else:
+                # An SDK server reports a tool that returns None as {"result": null}.
+                no_output = True
 
         # Apply output filter if configured for this tool
         if function_name in self._tools_output_filters:
@@ -610,10 +617,14 @@ class MCPClient(BaseObject):
             except Exception:
                 logger.error(f"Error applying output filter for {function_name}")
                 response = ""
+                no_output = False
 
         if isinstance(response, str) and response:
             logger.info(f"Tool '{function_name}' completed successfully")
             logger.debug(f"Final response: {response}")
+        elif no_output and not response:
+            logger.info(f"Tool '{function_name}' completed with no output")
+            response = ""
         else:
             response = error_msg or "Sorry, could not call the mcp tool"
 

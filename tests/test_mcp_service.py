@@ -284,6 +284,57 @@ class TestTools(MCPClientTestBase):
         result_callback.assert_awaited_once_with("Paris\nLondon")
         await client.close()
 
+    async def test_handler_delivers_an_empty_result_as_no_output(self):
+        # A tool with nothing to return, such as one that ends the call, succeeded.
+        client, server = self._make_client([_tool("tool_a")])
+        server.empty_results = True
+        tools_schema = await client.tools()
+        result_callback = await self._call_via_handler(tools_schema, "tool_a")
+        result_callback.assert_awaited_once_with("")
+        await client.close()
+
+    async def test_handler_delivers_a_tool_returning_none_as_no_output(self):
+        # What an SDK server sends for a tool annotated to return None.
+        client, server = self._make_client([_tool("tool_a")])
+        server.call_result = CallToolResult(content=[], structured_content={"result": None})
+        tools_schema = await client.tools()
+        result_callback = await self._call_via_handler(tools_schema, "tool_a")
+        result_callback.assert_awaited_once_with("")
+        await client.close()
+
+    async def test_handler_delivers_structured_content_when_there_is_no_text(self):
+        client, server = self._make_client([_tool("tool_a")])
+        server.call_result = CallToolResult(
+            content=[], structured_content={"city": "Zürich", "temperature": 21}
+        )
+        tools_schema = await client.tools()
+        result_callback = await self._call_via_handler(tools_schema, "tool_a")
+        result_callback.assert_awaited_once_with('{"city": "Zürich", "temperature": 21}')
+        await client.close()
+
+    async def test_handler_applies_output_filter_to_an_empty_result(self):
+        client, server = self._make_client(
+            [_tool("tool_a")], tools_output_filters={"tool_a": lambda text: text or "done"}
+        )
+        server.empty_results = True
+        tools_schema = await client.tools()
+        result_callback = await self._call_via_handler(tools_schema, "tool_a")
+        result_callback.assert_awaited_once_with("done")
+        await client.close()
+
+    async def test_a_failing_output_filter_on_an_empty_result_reads_as_the_stock_line(self):
+        def failing_filter(text):
+            raise ValueError("bad filter")
+
+        client, server = self._make_client(
+            [_tool("tool_a")], tools_output_filters={"tool_a": failing_filter}
+        )
+        server.empty_results = True
+        tools_schema = await client.tools()
+        result_callback = await self._call_via_handler(tools_schema, "tool_a")
+        result_callback.assert_awaited_once_with("Sorry, could not call the mcp tool")
+        await client.close()
+
     async def test_handler_applies_output_filter(self):
         client, server = self._make_client(
             [_tool("tool_a")], tools_output_filters={"tool_a": lambda text: text.upper()}
@@ -540,9 +591,9 @@ class TestCallErrors(MCPClientTestBase):
         result_callback.assert_awaited_once_with("tool_a-RESULT")
         await client.close()
 
-    async def test_an_empty_result_still_reads_as_the_stock_line(self):
+    async def test_an_empty_error_result_still_reads_as_the_stock_line(self):
         client, server = self._make_client([_tool("tool_a")])
-        server.empty_results = True
+        server.call_result = CallToolResult(content=[], is_error=True)
         tools_schema = await client.tools()
         result_callback = await self._call_via_handler(tools_schema, "tool_a")
         result_callback.assert_awaited_once_with("Sorry, could not call the mcp tool")
